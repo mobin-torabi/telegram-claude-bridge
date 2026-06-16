@@ -68,18 +68,32 @@ POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "20" if not PROXY else "10"))
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TG_LIMIT = 4000  # Telegram hard limit is 4096; leave headroom.
 
-SYSTEM_PROMPT = (
-    "You are being operated remotely by your owner through a Telegram bot, "
-    "running on their Windows laptop with full permissions. They may be on a "
-    "phone, so keep replies concise and readable on a small screen. When asked "
-    "to do something on the machine, just do it and report the result briefly. "
-    "Do not ask for confirmation for routine actions; you are trusted here."
+# Sent on the read-only (plan) pass: answer questions, but only *propose* actions.
+PLAN_SYS = (
+    "You are being operated remotely by your owner through a Telegram bot on "
+    "their Windows laptop. They may be on a phone, so keep replies short and "
+    "readable on a small screen. If they only want information or ask a "
+    "question, answer it directly (reading/inspecting the machine to answer is "
+    "fine). If fulfilling the request requires CHANGING anything on the machine "
+    "(running commands, creating/editing/deleting files, installing, sending "
+    "things, etc.), do NOT do it yet — instead present a short plan and request "
+    "approval. Keep the plan to a few plain lines a phone user can skim."
+)
+
+# Sent on the execute pass, after the owner approves.
+EXEC_SYS = (
+    "You are being operated remotely by your owner through a Telegram bot on "
+    "their Windows laptop, with full permissions. They just APPROVED the plan "
+    "you proposed. Carry out every step needed to complete it now, then report "
+    "briefly what you did. Keep the reply short and phone-friendly."
 )
 
 CLAUDE_BIN = shutil.which("claude") or "claude"
 
 # Per-conversation Claude session id, so the bot keeps context between messages.
 _session_id = None
+# True while a proposed plan is waiting for the owner's yes/no.
+_pending = False
 _claude_lock = threading.Lock()
 
 
@@ -117,16 +131,25 @@ def typing_loop(chat_id, stop: threading.Event) -> None:
 # Claude invocation
 # --------------------------------------------------------------------------- #
 
-def run_claude(prompt: str) -> str:
-    """Run one prompt through the Claude Code CLI and return its text result."""
+def run_claude(prompt: str, mode: str) -> dict:
+    """Run one prompt through the Claude CLI.
+
+    mode="plan"    -> read-only: answers questions, can't change anything.
+    mode="execute" -> full permissions: actually carries out the work.
+
+    Returns {"text": str, "plan": str|None}. When "plan" is set, Claude wants
+    approval before acting (it tried to leave plan mode) and "plan" holds the
+    proposed steps.
+    """
     global _session_id
 
-    cmd = [
-        CLAUDE_BIN, "-p", prompt,
-        "--output-format", "json",
-        "--dangerously-skip-permissions",
-        "--append-system-prompt", SYSTEM_PROMPT,
-    ]
+    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json"]
+    if mode == "plan":
+        cmd += ["--permission-mode", "plan", "--append-system-prompt", PLAN_SYS]
+    else:
+        cmd += ["--dangerously-skip-permissions",
+                "--append-system-prompt", EXEC_SYS]
+
     if _session_id:
         cmd += ["--resume", _session_id]
     else:
@@ -142,26 +165,36 @@ def run_claude(prompt: str) -> str:
             timeout=CLAUDE_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return f"⏱️ Timed out after {CLAUDE_TIMEOUT}s. Try /new and a smaller step."
+        return {"text": f"⏱️ Timed out after {CLAUDE_TIMEOUT}s. Try /new and a "
+                        "smaller step.", "plan": None}
     except Exception as exc:  # noqa: BLE001
-        return f"⚠️ Could not run Claude: {exc}"
+        return {"text": f"⚠️ Could not run Claude: {exc}", "plan": None}
 
     out = (proc.stdout or "").strip()
     if not out:
         err = (proc.stderr or "").strip()
-        return f"⚠️ Claude returned nothing.\n{err[:1500]}"
+        return {"text": f"⚠️ Claude returned nothing.\n{err[:1500]}", "plan": None}
 
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
-        return out[:TG_LIMIT]
+        return {"text": out[:TG_LIMIT], "plan": None}
 
     # Keep session continuity in sync with what the CLI actually used.
     _session_id = data.get("session_id", _session_id)
     result = data.get("result", "")
     if data.get("is_error"):
-        return f"⚠️ {result or 'Claude reported an error.'}"
-    return result or "(no text result)"
+        return {"text": f"⚠️ {result or 'Claude reported an error.'}", "plan": None}
+
+    # In plan mode, a request to act shows up as a denied ExitPlanMode call
+    # whose input carries the proposed plan.
+    if mode == "plan":
+        for d in data.get("permission_denials", []):
+            if d.get("tool_name") == "ExitPlanMode":
+                plan = (d.get("tool_input") or {}).get("plan", "").strip()
+                return {"text": result, "plan": plan or result}
+
+    return {"text": result or "(no text result)", "plan": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -169,17 +202,56 @@ def run_claude(prompt: str) -> str:
 # --------------------------------------------------------------------------- #
 
 HELP = (
-    "🤖 Claude bridge — talk to me and I'll act on your laptop.\n\n"
-    "Just send a message and I'll run it.\n\n"
+    "🤖 Claude bridge\n\n"
+    "Ask me anything and I'll answer. If a request means changing something on "
+    "your laptop, I'll show a short plan and ask first — reply *yes* and I'll "
+    "do it.\n\n"
     "/new — start a fresh conversation (clears memory)\n"
     "/cwd — show my working directory\n"
     "/ping — check I'm alive\n"
     "/help — this message"
 )
 
+# Words/phrases that count as approving a pending plan.
+_YES_WORDS = {
+    "yes", "y", "yeah", "yep", "yup", "ya", "ok", "okay", "k", "sure", "fine",
+    "confirm", "confirmed", "approve", "approved", "proceed", "go", "run", "do",
+    "بله", "بعله", "اره", "آره", "باشه", "اوکی", "اوکیه", "تایید", "تأیید",
+    "برو", "حتما", "بزن", "انجامش", "انجام",
+}
+_YES_PHRASES = (
+    "do it", "go ahead", "go for it", "do that", "yes please", "please do",
+    "make it", "go on", "sounds good", "lets do it", "let's do it",
+    "انجام بده", "انجامش بده", "انجام بدش", "برو جلو", "برو بریم",
+)
+_NO_WORDS = ("no", "dont", "don't", "stop", "cancel", "nope", "نه", "نکن", "لغو",
+             "بیخیال", "نخیر")
+
+
+def is_affirmative(text: str) -> bool:
+    """True only when the reply clearly approves the pending plan."""
+    t = text.strip().lower().rstrip(".!۔، ")
+    if any(n == t or t.startswith(n + " ") for n in _NO_WORDS):
+        return False
+    if t in _YES_WORDS:
+        return True
+    return any(p in t for p in _YES_PHRASES)
+
+
+def ask_claude(chat_id, text: str, mode: str) -> dict:
+    """Run Claude with a live 'typing…' indicator and return its result dict."""
+    stop = threading.Event()
+    t = threading.Thread(target=typing_loop, args=(chat_id, stop), daemon=True)
+    t.start()
+    try:
+        with _claude_lock:  # one Claude run at a time keeps sessions sane
+            return run_claude(text, mode)
+    finally:
+        stop.set()
+
 
 def handle(chat_id, text: str) -> None:
-    global _session_id
+    global _session_id, _pending
     cmd = text.strip().lower()
 
     if cmd in ("/start", "/help"):
@@ -194,18 +266,28 @@ def handle(chat_id, text: str) -> None:
     if cmd == "/new":
         with _claude_lock:
             _session_id = None
+            _pending = False
         send(chat_id, "🧹 Fresh conversation started.")
         return
 
-    stop = threading.Event()
-    t = threading.Thread(target=typing_loop, args=(chat_id, stop), daemon=True)
-    t.start()
-    try:
-        with _claude_lock:  # one Claude run at a time keeps sessions sane
-            reply = run_claude(text)
-    finally:
-        stop.set()
-    send(chat_id, reply)
+    # A plan is awaiting approval and this reply is a clear yes -> execute it.
+    if _pending and is_affirmative(text):
+        _pending = False
+        res = ask_claude(chat_id, text, mode="execute")
+        send(chat_id, res["text"])
+        return
+
+    # Otherwise treat it as a fresh request: read-only plan pass. Nothing on the
+    # laptop changes here — at most Claude proposes a plan and asks.
+    _pending = False
+    res = ask_claude(chat_id, text, mode="plan")
+    if res["plan"]:
+        _pending = True
+        msg = "📋 I'd like to do this:\n\n" + res["plan"]
+        msg += "\n\n— Reply *yes* to go ahead, or tell me what to change."
+        send(chat_id, msg)
+    else:
+        send(chat_id, res["text"])
 
 
 # --------------------------------------------------------------------------- #

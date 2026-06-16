@@ -8,14 +8,23 @@ It works by feeding each Telegram message to the local `claude` CLI in headless
 mode, then sending Claude's answer back to the chat. Conversation context is
 kept between messages, so you can have a back-and-forth.
 
+**Ask-before-acting:** every message first runs in read-only **plan mode** —
+Claude can answer questions and inspect things, but cannot change anything. If a
+request requires modifying the machine, Claude replies with a short plan and
+waits. Only when you reply **yes** does it re-run with full permissions and
+carry the plan out.
+
 ---
 
 ## ⚠️ Read this first — security
 
-This bot runs Claude with `--dangerously-skip-permissions`, meaning Claude can
-do **anything on your laptop without asking**. The only protection is the
-**chat-id allowlist**: the bot ignores every message that isn't from your
-`ALLOWED_CHAT_ID`.
+Two layers protect the machine:
+
+1. **Approval gate.** By default Claude runs read-only (`--permission-mode
+   plan`) and can't modify anything. It only executes (with
+   `--dangerously-skip-permissions`) after you approve a proposed plan.
+2. **Chat-id allowlist.** The bot ignores every message that isn't from your
+   `ALLOWED_CHAT_ID`.
 
 - Keep your `BOT_TOKEN` secret. Anyone with the token *plus* the ability to send
   from your account could control the machine. The token lives only in `.env`,
@@ -61,11 +70,23 @@ Leave the window open while you want the bot live. Close it to stop.
 
 ## Using it
 
-Just message the bot. Examples:
+Just message the bot.
+
+**Questions are answered straight away:**
 
 > *what's my laptop's free disk space?*
-> *open the latest file in my Downloads and summarize it*
-> *commit and push my notes repo*
+> *summarize the newest file in my Downloads*
+
+**Anything that changes the machine is confirmed first:**
+
+> **You:** *create a backup of my notes folder on the desktop*
+> **Bot:** 📋 I'd like to do this: … — Reply *yes* to go ahead.
+> **You:** *yes*
+> **Bot:** ✅ Done — copied 142 files to Desktop\notes-backup.
+
+Reply with anything other than a clear yes (or a tweak like "yes but zip it")
+and it re-plans instead of acting. Affirmatives are recognized in English and
+Persian.
 
 Commands:
 

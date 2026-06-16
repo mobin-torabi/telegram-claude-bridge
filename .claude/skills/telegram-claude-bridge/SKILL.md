@@ -5,10 +5,29 @@ description: Start, stop, or troubleshoot the Telegram↔Claude bridge that lets
 
 # Telegram ↔ Claude Code bridge
 
-A Python bot (`bridge.py`) that long-polls Telegram, and for each message from
-the authorized user runs it through the local `claude` CLI in headless mode
-(`-p --output-format json --dangerously-skip-permissions`), then sends the
-result back. Conversation context is kept via `--session-id`/`--resume`.
+A Python bot (`bridge.py`) that long-polls Telegram and, for each message from
+the authorized user, runs it through the local `claude` CLI in headless mode,
+then sends the result back. Conversation context is kept via
+`--session-id`/`--resume`.
+
+## Ask-before-acting flow (important)
+
+Two-phase, so Claude answers questions but never changes the machine without a
+yes:
+
+1. **Plan pass** — every fresh message runs with `--permission-mode plan`
+   (read-only). Pure questions are answered. If the request needs changes,
+   plan mode blocks the action; Claude's intent appears as a denied
+   `ExitPlanMode` entry in the JSON `permission_denials`, whose
+   `tool_input.plan` holds the proposed steps. The bot sends that plan and sets
+   `_pending = True`.
+2. **Execute pass** — when `_pending` and the reply is affirmative
+   (`is_affirmative()`, English + Persian, with a negation guard), the bot
+   resumes the same session with `--dangerously-skip-permissions` and the work
+   is carried out. Any non-affirmative reply just starts a new plan pass — so
+   execution only ever happens after an explicit yes.
+
+`PLAN_SYS` / `EXEC_SYS` are the per-phase appended system prompts.
 
 Project root: `D:\Mobin\Automation Programs\Telegram Claude Bridge`
 
@@ -27,9 +46,9 @@ All config is in `.env` (gitignored; copy from `.env.example`):
 ## Security model
 
 Single-user. The bot only acts on messages whose `chat.id` equals
-`ALLOWED_CHAT_ID`; everyone else gets "Not authorized" and is ignored. Because
-it runs with skipped permissions, the chat-id allowlist is the whole security
-boundary. Never commit `.env`; if the token leaks, `/revoke` in @BotFather.
+`ALLOWED_CHAT_ID`; everyone else gets "Not authorized" and is ignored. Plus the
+approval gate above means nothing is modified without an explicit yes. Never
+commit `.env`; if the token leaks, `/revoke` in @BotFather.
 
 ## Bot commands
 
