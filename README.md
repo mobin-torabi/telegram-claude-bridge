@@ -90,6 +90,11 @@ bit; the reply arrives when it's done.
 | `WORKING_DIR` | Default folder Claude runs in (default: your home folder) |
 | `CLAUDE_MODEL` | Optional model id, e.g. `claude-opus-4-8` |
 | `CLAUDE_TIMEOUT` | Max seconds for one task before it's cancelled (default 1800) |
+| `PROXY` | Optional proxy for reaching Telegram where it's blocked, e.g. `http://127.0.0.1:10808` |
+
+> **Where Telegram is blocked:** set `PROXY` to your local VPN/proxy client's
+> port (v2rayN defaults to `10808`). The bot routes only its Telegram traffic
+> through it. Keep that client running while the bot is up.
 
 ---
 

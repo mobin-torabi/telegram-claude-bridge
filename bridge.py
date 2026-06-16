@@ -23,6 +23,14 @@ from pathlib import Path
 
 import requests
 
+# Windows consoles default to cp1252 and choke on emoji in our logs.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace",
+                            line_buffering=True)
+    except Exception:  # noqa: BLE001
+        pass
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -50,6 +58,12 @@ WORKING_DIR = os.environ.get("WORKING_DIR", str(Path.home())).strip()
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()  # optional, e.g. claude-opus-4-8
 # Hard ceiling so a runaway task can't block the bot forever (seconds).
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
+# Optional proxy for reaching api.telegram.org (e.g. where Telegram is blocked).
+# Example: http://127.0.0.1:10808  (v2rayN's default local proxy)
+PROXY = os.environ.get("PROXY", "").strip()
+PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
+# Long-poll seconds. Keep short when behind a proxy that drops idle tunnels.
+POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "20" if not PROXY else "10"))
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TG_LIMIT = 4000  # Telegram hard limit is 4096; leave headroom.
@@ -75,7 +89,9 @@ _claude_lock = threading.Lock()
 
 def tg(method: str, **params):
     try:
-        r = requests.post(f"{API}/{method}", data=params, timeout=70)
+        # Read timeout must exceed the long-poll window we ask Telegram for.
+        r = requests.post(f"{API}/{method}", data=params,
+                          timeout=POLL_TIMEOUT + 15, proxies=PROXIES)
         return r.json()
     except Exception as exc:  # noqa: BLE001
         print(f"[tg] {method} failed: {exc}", file=sys.stderr)
@@ -217,7 +233,7 @@ def main() -> None:
     send(ALLOWED_CHAT_ID, "✅ Claude bridge online. Send /help.")
 
     while True:
-        resp = tg("getUpdates", offset=offset, timeout=50)
+        resp = tg("getUpdates", offset=offset, timeout=POLL_TIMEOUT)
         if not resp.get("ok"):
             time.sleep(3)
             continue
