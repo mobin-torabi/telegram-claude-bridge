@@ -232,7 +232,9 @@ def stage_to_onedrive(chat_id, raw_path: str) -> None:
     drop = onedrive_drop()
     try:
         drop.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, drop / src.name)
+        dest = drop / src.name
+        shutil.copy(src, dest)        # copy() gives dest a current timestamp...
+        os.utime(dest, None)          # ...and this nudges OneDrive to sync it now
     except Exception as exc:  # noqa: BLE001
         send(chat_id, f"⚠️ Couldn't copy {src.name} to OneDrive: {exc}")
         return
