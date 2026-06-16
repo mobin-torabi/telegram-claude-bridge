@@ -104,6 +104,17 @@ Reply with anything other than a clear yes (or a tweak like "yes but zip it")
 and it re-plans instead of acting. Affirmatives are recognized in English and
 Persian.
 
+**Getting files while you're out:** just ask for a file and it's delivered to
+your chat.
+
+> *send me my resume from Downloads*
+> *get me the latest screenshot on my desktop*
+
+Files up to **50 MB** arrive directly in Telegram; larger ones are uploaded and
+sent as a download link. (This is read-only, so it works in any mode — even
+`lock`.) Want a whole folder? Ask and, with permission to act, it'll zip it
+first.
+
 **Changing what it's allowed to do, remotely:** when you're away from the
 laptop, send `/auto` to let it act without asking, or `/lock` to stop it
 changing anything. `/mode` shows the current setting.

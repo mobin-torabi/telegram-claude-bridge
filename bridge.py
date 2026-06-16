@@ -16,6 +16,7 @@ account.
 
 import json
 import os
+import re
 import shutil
 import string
 import subprocess
@@ -106,6 +107,18 @@ EXEC_SYS = (
     "briefly what you did. Keep the reply short and phone-friendly."
 )
 
+# Appended in every mode: how Claude hands a file back to the user's phone.
+FILE_SYS = (
+    "FILE DELIVERY: when the user wants to receive / download / get / send "
+    "themselves a file, deliver it by outputting a line exactly like:\n"
+    "[[SENDFILE: <absolute path to the file>]]\n"
+    "one line per file. The bridge uploads it to their Telegram chat — you do "
+    "NOT need to read or print the file's contents. Delivering an existing file "
+    "is read-only, so do it directly without asking for approval. If they want "
+    "many files or a whole folder and you have permission to act, you may make a "
+    "single .zip first and send that zip's path."
+)
+
 CLAUDE_BIN = shutil.which("claude") or "claude"
 
 # Per-conversation Claude session id, so the bot keeps context between messages.
@@ -189,6 +202,67 @@ def typing_loop(chat_id, stop: threading.Event) -> None:
         stop.wait(4)
 
 
+# Telegram bots can upload files up to 50 MB; bigger ones go via a link service.
+TG_FILE_LIMIT = 49 * 1024 * 1024
+SENDFILE_RE = re.compile(r"\[\[SENDFILE:\s*(.+?)\]\]")
+
+
+def upload_large(path: Path):
+    """Upload a too-big-for-Telegram file to 0x0.st and return its URL, or None."""
+    try:
+        with path.open("rb") as f:
+            r = requests.post("https://0x0.st", files={"file": (path.name, f)},
+                              headers={"User-Agent": "telegram-claude-bridge"},
+                              proxies=PROXIES, timeout=600)
+        if r.ok and r.text.strip().startswith("http"):
+            return r.text.strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[upload] {exc}", file=sys.stderr)
+    return None
+
+
+def send_file(chat_id, raw_path: str) -> None:
+    """Deliver one file to Telegram (direct upload, or a link if too large)."""
+    path = Path(raw_path.strip().strip('"'))
+    if not path.is_file():
+        send(chat_id, f"⚠️ File not found: {path}")
+        return
+
+    size = path.stat().st_size
+    if size > TG_FILE_LIMIT:
+        mb = size // (1024 * 1024)
+        tg("sendChatAction", chat_id=chat_id, action="upload_document")
+        link = upload_large(path)
+        if link:
+            send(chat_id, f"📎 {path.name} ({mb} MB) is too big to send in chat, "
+                          f"so here's a download link:\n{link}")
+        else:
+            send(chat_id, f"⚠️ {path.name} is {mb} MB — over Telegram's 50 MB "
+                          "limit and the upload fallback failed.")
+        return
+
+    tg("sendChatAction", chat_id=chat_id, action="upload_document")
+    try:
+        with path.open("rb") as f:
+            r = requests.post(f"{API}/sendDocument", data={"chat_id": chat_id},
+                              files={"document": (path.name, f)},
+                              proxies=PROXIES, timeout=300)
+        if not r.json().get("ok"):
+            send(chat_id, f"⚠️ Telegram refused {path.name}: {r.text[:300]}")
+    except Exception as exc:  # noqa: BLE001
+        send(chat_id, f"⚠️ Couldn't send {path.name}: {exc}")
+
+
+def deliver(chat_id, text: str) -> None:
+    """Send Claude's reply, plus any files it flagged with [[SENDFILE: ...]]."""
+    paths = SENDFILE_RE.findall(text or "")
+    clean = SENDFILE_RE.sub("", text or "").strip()
+    if clean or not paths:
+        send(chat_id, clean)
+    for p in paths:
+        send_file(chat_id, p)
+
+
 # --------------------------------------------------------------------------- #
 # Claude invocation
 # --------------------------------------------------------------------------- #
@@ -205,7 +279,8 @@ def run_claude(prompt: str, mode: str) -> dict:
     """
     global _session_id
 
-    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json"]
+    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json",
+           "--append-system-prompt", FILE_SYS]
     if mode == "plan":
         cmd += ["--permission-mode", "plan", "--append-system-prompt", PLAN_SYS]
         for d in EXTRA_DIRS:  # let read-only Q&A reach any drive/folder
@@ -267,8 +342,10 @@ def run_claude(prompt: str, mode: str) -> dict:
 
 HELP = (
     "🤖 Claude bridge\n\n"
-    "Ask me anything and I'll answer. If a request means changing something on "
-    "your laptop, what happens depends on the permission mode:\n\n"
+    "Ask me anything and I'll answer, and I can send you files from the laptop "
+    "(just ask, e.g. 'send me my resume from Downloads').\n\n"
+    "If a request means changing something on your laptop, what happens depends "
+    "on the permission mode:\n\n"
     "🔒 /lock — answers only, never changes anything\n"
     "🟡 /ask — propose a plan, wait for your *yes* (default)\n"
     "🟢 /auto — act immediately, no asking (full access)\n"
@@ -355,21 +432,22 @@ def handle(chat_id, text: str) -> None:
     if _mode == "auto":
         _pending = False
         res = ask_claude(chat_id, text, mode="execute")
-        send(chat_id, res["text"])
+        deliver(chat_id, res["text"])
         return
 
     # ask: a plan is awaiting approval and this reply is a clear yes -> do it.
     if _mode == "ask" and _pending and is_affirmative(text):
         _pending = False
         res = ask_claude(chat_id, text, mode="execute")
-        send(chat_id, res["text"])
+        deliver(chat_id, res["text"])
         return
 
-    # lock / ask: read-only plan pass. Nothing on the laptop changes here.
+    # lock / ask: read-only plan pass. Nothing on the laptop changes here
+    # (fetching an existing file is read-only, so it still works in every mode).
     _pending = False
     res = ask_claude(chat_id, text, mode="plan")
     if not res["plan"]:
-        send(chat_id, res["text"])
+        deliver(chat_id, res["text"])
         return
 
     if _mode == "lock":

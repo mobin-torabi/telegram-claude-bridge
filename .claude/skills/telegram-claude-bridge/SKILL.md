@@ -44,6 +44,15 @@ The plan pass is launched with `--add-dir` for every drive root
 (`EXTRA_DIRS` / `system_dirs()`), so read-only Q&A can reach anywhere on the
 machine. Execute pass uses `--dangerously-skip-permissions` (whole machine).
 
+## Sending files to the user
+
+`FILE_SYS` (appended to the prompt in every mode) tells Claude to deliver a file
+by printing `[[SENDFILE: <absolute path>]]`. `deliver()` strips those markers
+from the reply and calls `send_file()`, which uploads via Telegram
+`sendDocument` (≤ ~50 MB) or, for bigger files, `upload_large()` → 0x0.st and
+sends the link. Fetching an existing file is read-only, so it works in `lock`
+mode too (no approval). Uploads go through `PROXIES` like everything else.
+
 Project root: `D:\Mobin\Automation Programs\Telegram Claude Bridge`
 
 ## Run / stop
