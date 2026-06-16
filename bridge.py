@@ -109,14 +109,24 @@ EXEC_SYS = (
 
 # Appended in every mode: how Claude hands a file back to the user's phone.
 FILE_SYS = (
-    "FILE DELIVERY: when the user wants to receive / download / get / send "
-    "themselves a file, deliver it by outputting a line exactly like:\n"
+    "FILE DELIVERY — IMPORTANT. When the user asks to send / get / download / "
+    "share / 'give me' a FILE (e.g. 'send me X', 'get me the file Y'), you MUST "
+    "deliver the actual file as an attachment, NOT its text. Do this by "
+    "outputting a line EXACTLY like:\n"
     "[[SENDFILE: <absolute path to the file>]]\n"
-    "one line per file. The bridge uploads it to their Telegram chat — you do "
-    "NOT need to read or print the file's contents. Delivering an existing file "
-    "is read-only, so do it directly without asking for approval. If they want "
-    "many files or a whole folder and you have permission to act, you may make a "
-    "single .zip first and send that zip's path."
+    "one line per file. The bridge then uploads that file to the user's Telegram "
+    "chat. Rules:\n"
+    "- Do NOT print, paste, quote, dump, or summarize the file's contents when "
+    "asked to SEND it. Reply with at most one short sentence plus the marker.\n"
+    "- Works for any file type (html, pdf, images, code, zip, ...). It is "
+    "read-only, so do it directly without asking for approval.\n"
+    "- Only show a file's contents instead when the user explicitly asks to "
+    "'read', 'open', 'show', or 'see inside' it.\n"
+    "- For several files or a whole folder, if you may act, zip them first and "
+    "send the zip's path.\n"
+    "Example — user: 'send me notes.txt on my desktop' → you reply:\n"
+    "Here you go.\n"
+    "[[SENDFILE: C:\\Users\\You\\Desktop\\notes.txt]]"
 )
 
 CLAUDE_BIN = shutil.which("claude") or "claude"
