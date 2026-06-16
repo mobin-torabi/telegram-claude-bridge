@@ -279,15 +279,17 @@ def run_claude(prompt: str, mode: str) -> dict:
     """
     global _session_id
 
+    # NOTE: pass ONE --append-system-prompt only. This CLI keeps just the last
+    # occurrence, so combine the mode prompt and the file-delivery prompt.
+    sys_prompt = (PLAN_SYS if mode == "plan" else EXEC_SYS) + "\n\n" + FILE_SYS
     cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json",
-           "--append-system-prompt", FILE_SYS]
+           "--append-system-prompt", sys_prompt]
     if mode == "plan":
-        cmd += ["--permission-mode", "plan", "--append-system-prompt", PLAN_SYS]
+        cmd += ["--permission-mode", "plan"]
         for d in EXTRA_DIRS:  # let read-only Q&A reach any drive/folder
             cmd += ["--add-dir", d]
     else:
-        cmd += ["--dangerously-skip-permissions",
-                "--append-system-prompt", EXEC_SYS]
+        cmd += ["--dangerously-skip-permissions"]
 
     if _session_id:
         cmd += ["--resume", _session_id]
