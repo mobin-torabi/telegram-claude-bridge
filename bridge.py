@@ -114,8 +114,8 @@ FILE_SYS = (
     "deliver the actual file as an attachment, NOT its text. Do this by "
     "outputting a line EXACTLY like:\n"
     "[[SENDFILE: <absolute path to the file>]]\n"
-    "one line per file. The bridge then uploads that file to the user's Telegram "
-    "chat. Rules:\n"
+    "one line per file. The bridge then delivers that file to the user (it "
+    "stages it to their cloud drive — you don't handle that part). Rules:\n"
     "- Do NOT print, paste, quote, dump, or summarize the file's contents when "
     "asked to SEND it. Reply with at most one short sentence plus the marker.\n"
     "- Works for any file type (html, pdf, images, code, zip, ...). It is "
@@ -129,15 +129,6 @@ FILE_SYS = (
     "[[SENDFILE: C:\\Users\\You\\Desktop\\notes.txt]]"
 )
 
-# Prepended to the user's text for a clear "send me a file" request, to force
-# the actual file out as an attachment instead of a chatty summary.
-FILE_DIRECTIVE = (
-    "\n\n[INSTRUCTION: The user wants to RECEIVE the file(s) above as a Telegram "
-    "attachment. Find each file's absolute path and output exactly one line per "
-    "file: [[SENDFILE: <absolute path>]] — with nothing about the contents. Do "
-    "NOT paste, summarize, quote, or describe the file. If you genuinely cannot "
-    "find the file, say so in one short sentence.]"
-)
 
 CLAUDE_BIN = shutil.which("claude") or "claude"
 
@@ -222,65 +213,43 @@ def typing_loop(chat_id, stop: threading.Event) -> None:
         stop.wait(4)
 
 
-# Telegram bots can upload files up to 50 MB; bigger ones go via a link service.
-TG_FILE_LIMIT = 49 * 1024 * 1024
 SENDFILE_RE = re.compile(r"\[\[SENDFILE:\s*(.+?)\]\]")
 
 
-def upload_large(path: Path):
-    """Upload a too-big-for-Telegram file to 0x0.st and return its URL, or None."""
-    try:
-        with path.open("rb") as f:
-            r = requests.post("https://0x0.st", files={"file": (path.name, f)},
-                              headers={"User-Agent": "telegram-claude-bridge"},
-                              proxies=PROXIES, timeout=600)
-        if r.ok and r.text.strip().startswith("http"):
-            return r.text.strip()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[upload] {exc}", file=sys.stderr)
-    return None
+def onedrive_drop() -> Path:
+    """The OneDrive subfolder where requested files are staged for the phone."""
+    base = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer")
+    root = Path(base) if base else (Path.home() / "OneDrive")
+    return root / os.environ.get("ONEDRIVE_DROP", "PhoneDrops")
 
 
-def send_file(chat_id, raw_path: str) -> None:
-    """Deliver one file to Telegram (direct upload, or a link if too large)."""
-    path = Path(raw_path.strip().strip('"'))
-    if not path.is_file():
-        send(chat_id, f"⚠️ File not found: {path}")
+def stage_to_onedrive(chat_id, raw_path: str) -> None:
+    """Copy one file into the OneDrive drop folder so it syncs to the phone."""
+    src = Path(raw_path.strip().strip('"'))
+    if not src.is_file():
+        send(chat_id, f"⚠️ File not found: {src}")
         return
-
-    size = path.stat().st_size
-    if size > TG_FILE_LIMIT:
-        mb = size // (1024 * 1024)
-        tg("sendChatAction", chat_id=chat_id, action="upload_document")
-        link = upload_large(path)
-        if link:
-            send(chat_id, f"📎 {path.name} ({mb} MB) is too big to send in chat, "
-                          f"so here's a download link:\n{link}")
-        else:
-            send(chat_id, f"⚠️ {path.name} is {mb} MB — over Telegram's 50 MB "
-                          "limit and the upload fallback failed.")
-        return
-
-    tg("sendChatAction", chat_id=chat_id, action="upload_document")
+    drop = onedrive_drop()
     try:
-        with path.open("rb") as f:
-            r = requests.post(f"{API}/sendDocument", data={"chat_id": chat_id},
-                              files={"document": (path.name, f)},
-                              proxies=PROXIES, timeout=300)
-        if not r.json().get("ok"):
-            send(chat_id, f"⚠️ Telegram refused {path.name}: {r.text[:300]}")
+        drop.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, drop / src.name)
     except Exception as exc:  # noqa: BLE001
-        send(chat_id, f"⚠️ Couldn't send {path.name}: {exc}")
+        send(chat_id, f"⚠️ Couldn't copy {src.name} to OneDrive: {exc}")
+        return
+    send(chat_id,
+         f"✅ {src.name} is now in your OneDrive › {drop.name}.\n"
+         "Open the OneDrive app (or onedrive.com) on your phone to grab it — "
+         "give it a few seconds to sync.")
 
 
 def deliver(chat_id, text: str) -> None:
-    """Send Claude's reply, plus any files it flagged with [[SENDFILE: ...]]."""
+    """Send Claude's reply, and stage any files it flagged with [[SENDFILE:]]."""
     paths = SENDFILE_RE.findall(text or "")
     clean = SENDFILE_RE.sub("", text or "").strip()
     if clean or not paths:
         send(chat_id, clean)
     for p in paths:
-        send_file(chat_id, p)
+        stage_to_onedrive(chat_id, p)
 
 
 # --------------------------------------------------------------------------- #
@@ -358,38 +327,89 @@ def run_claude(prompt: str, mode: str) -> dict:
     return {"text": result or "(no text result)", "plan": None}
 
 
-def request_file_reply(text: str) -> str:
-    """One-off, read-only pass that returns Claude's reply for a file request.
+# Map a word in the request to a standard user folder.
+_LOC_MAP = [("desktop", "Desktop"), ("download", "Downloads"),
+            ("document", "Documents"), ("picture", "Pictures"),
+            ("photo", "Pictures"), ("video", "Videos"), ("music", "Music")]
+# Words that aren't useful as filename keywords.
+_STOP = {
+    "send", "me", "the", "a", "an", "file", "files", "in", "on", "my", "get",
+    "please", "to", "from", "of", "that", "this", "want", "need", "give", "it",
+    "download", "share", "fetch", "grab", "for", "is", "there", "which", "named",
+    "name", "called", "folder", "could", "you", "can", "and", "with", "at",
+    "into", "onedrive", "cloud", "link", "desktop", "downloads", "document",
+    "documents", "pictures", "picture", "photo", "photos", "videos", "video",
+    "music",
+}
+_PATH_RE = re.compile(r'[A-Za-z]:[\\/][^\s"\'<>|]+')
+_EXT_RE = re.compile(r'([\w\-][\w\-.]*\.[A-Za-z0-9]{1,6})\b')
 
-    Isolated (no session persistence) so the chatty main conversation can't talk
-    it out of just emitting the [[SENDFILE]] marker. Read-only, so it's safe and
-    works regardless of permission mode. deliver() then sends any flagged files.
+
+def _dedup(seq):
+    seen, out = set(), []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def find_files_locally(text: str):
+    """Resolve which file(s) the user wants, deterministically (no model).
+
+    Looks for: an explicit path, then a filename with extension, then keyword
+    matches in the location they named (or Desktop/Downloads/Documents). Returns
+    a list of existing absolute paths (possibly empty).
     """
-    cmd = [CLAUDE_BIN, "-p", text + FILE_DIRECTIVE, "--output-format", "json",
-           "--permission-mode", "plan", "--no-session-persistence",
-           "--append-system-prompt", FILE_SYS]
-    for d in EXTRA_DIRS:
-        cmd += ["--add-dir", d]
-    if CLAUDE_MODEL:
-        cmd += ["--model", CLAUDE_MODEL]
-    try:
-        proc = subprocess.run(cmd, cwd=WORKING_DIR, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace",
-                              timeout=CLAUDE_TIMEOUT)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[filereq] {exc}", file=sys.stderr)
-        return "⚠️ Couldn't look up that file."
-    out = (proc.stdout or "").strip()
-    if not out:
-        return "🔍 I couldn't find that file."
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        # Not JSON — e.g. a rate-limit notice. Surface it rather than hide it.
-        return out[:TG_LIMIT]
-    if data.get("is_error"):
-        return f"⚠️ {data.get('result') or 'Couldn’t look up that file.'}"
-    return data.get("result", "") or "🔍 I couldn't find that file."
+    home = Path.home()
+    t = text.lower()
+
+    # 1. An explicit Windows path in the message.
+    for m in _PATH_RE.finditer(text):
+        p = Path(m.group(0).strip().strip('"').strip("'"))
+        if p.is_file():
+            return [str(p)]
+
+    # Which folders to look in (named location, else the usual suspects).
+    named = [home / folder for key, folder in _LOC_MAP
+             if key in t and (home / folder).is_dir()]
+    common = [d for d in (home / "Desktop", home / "Downloads",
+                          home / "Documents", Path(WORKING_DIR))
+              if d.is_dir()]
+    search_dirs = _dedup(named or common)
+
+    # 2. A filename with an extension (exact match wins, else substring).
+    subs = []
+    for m in _EXT_RE.finditer(text):
+        target = m.group(1).strip().lower()
+        for d in search_dirs + [home]:
+            try:
+                for f in d.iterdir():
+                    if not f.is_file():
+                        continue
+                    if f.name.lower() == target:
+                        return [str(f)]
+                    if target in f.name.lower():
+                        subs.append(str(f))
+            except OSError:
+                pass
+    if subs:
+        return _dedup(subs)[:5]
+
+    # 3. Keyword match on file names in the search folders.
+    words = [w for w in re.findall(r"[A-Za-z؀-ۿ]{3,}", t)
+             if w not in _STOP]
+    if not words:
+        return []
+    hits = []
+    for d in search_dirs:
+        try:
+            for f in d.iterdir():
+                if f.is_file() and any(w in f.name.lower() for w in words):
+                    hits.append(str(f))
+        except OSError:
+            pass
+    return _dedup(hits)[:5]
 
 
 # --------------------------------------------------------------------------- #
@@ -398,8 +418,9 @@ def request_file_reply(text: str) -> str:
 
 HELP = (
     "🤖 Claude bridge\n\n"
-    "Ask me anything and I'll answer, and I can send you files from the laptop "
-    "(just ask, e.g. 'send me my resume from Downloads').\n\n"
+    "Ask me anything and I'll answer. I can also put files from the laptop into "
+    "your OneDrive so you can grab them on your phone — just ask, e.g. 'send me "
+    "my resume from Downloads'.\n\n"
     "If a request means changing something on your laptop, what happens depends "
     "on the permission mode:\n\n"
     "🔒 /lock — answers only, never changes anything\n"
@@ -466,16 +487,18 @@ def wants_file(text: str) -> bool:
 
 
 def deliver_requested_files(chat_id, text: str) -> None:
-    """Find the file(s) the user wants and upload them (via deliver's markers)."""
-    stop = threading.Event()
-    th = threading.Thread(target=typing_loop, args=(chat_id, stop), daemon=True)
-    th.start()
-    try:
-        with _claude_lock:
-            reply = request_file_reply(text)
-    finally:
-        stop.set()
-    deliver(chat_id, reply)
+    """Find the file(s) the user wants and stage them to OneDrive."""
+    paths = find_files_locally(text)
+    if not paths:
+        send(chat_id, "🔍 I couldn't find that file. Tell me its name or full "
+                      "path (e.g. C:\\Users\\You\\Desktop\\name.ext) and which "
+                      "folder it's in.")
+        return
+    if len(paths) > 1:
+        names = "\n".join(f"• {Path(p).name}" for p in paths)
+        send(chat_id, f"Found {len(paths)} matches, sending all:\n{names}")
+    for p in paths:
+        stage_to_onedrive(chat_id, p)
 
 
 def ask_claude(chat_id, text: str, mode: str) -> dict:

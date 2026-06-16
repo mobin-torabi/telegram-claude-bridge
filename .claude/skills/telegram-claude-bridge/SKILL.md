@@ -46,20 +46,19 @@ machine. Execute pass uses `--dangerously-skip-permissions` (whole machine).
 
 ## Sending files to the user
 
-Claude flags a file for delivery by printing `[[SENDFILE: <absolute path>]]`.
-`deliver()` strips those markers from the reply and calls `send_file()`, which
-uploads via Telegram `sendDocument` (≤ ~50 MB) or, for bigger files,
-`upload_large()` → 0x0.st and sends the link. Fetching a file is read-only, so
-it works in `lock` mode too. Uploads go through `PROXIES`.
-
-Because the chatty main model often *summarizes* a file instead of sending it,
-clear "send me a file" asks are detected by `wants_file()` (send-verb + file
-hint, excluding "show/read/what's in") and routed to `deliver_requested_files()`
-→ `request_file_reply()`: a one-off, read-only, no-session-persistence pass with
-`FILE_DIRECTIVE` prepended to force the `[[SENDFILE]]` marker (no summary). This
-runs in every mode and bypasses the possibly-contaminated main session.
-`FILE_SYS` still rides along in the normal flow for files Claude volunteers
+Files are delivered to the user by copying them into a `PhoneDrops` folder
+inside their **OneDrive** (`onedrive_drop()`, configurable via `ONEDRIVE_DROP`),
+which the OneDrive client syncs to the cloud for the phone. `stage_to_onedrive()`
+does the copy; `deliver()` stages any `[[SENDFILE:]]` paths Claude volunteers
 mid-conversation.
+
+Public file-drop services (0x0.st/catbox/file.io) are blocked/disabled on the
+user's network, and Telegram `sendDocument` was abandoned because the model kept
+refusing/summarizing instead of emitting the path. So "send me a file" requests
+are now resolved **without the model**: `wants_file()` detects them and
+`find_files_locally()` parses an explicit path, then a filename+extension, then
+keyword+location matches against Desktop/Downloads/Documents/working dir,
+returning only existing paths. Deterministic, no refusals, no content dumps.
 
 Project root: `D:\Mobin\Automation Programs\Telegram Claude Bridge`
 

@@ -104,16 +104,18 @@ Reply with anything other than a clear yes (or a tweak like "yes but zip it")
 and it re-plans instead of acting. Affirmatives are recognized in English and
 Persian.
 
-**Getting files while you're out:** just ask for a file and it's delivered to
-your chat.
+**Getting files while you're out:** ask for a file and the bot copies it into a
+`PhoneDrops` folder in your **OneDrive**, which syncs to the cloud — open the
+OneDrive app (or onedrive.com) on your phone to grab it.
 
 > *send me my resume from Downloads*
-> *get me the latest screenshot on my desktop*
+> *get me the classes file on my desktop*
+> *send this to me: C:\Users\Me\Desktop\report.pdf*
 
-Files up to **50 MB** arrive directly in Telegram; larger ones are uploaded and
-sent as a download link. (This is read-only, so it works in any mode — even
-`lock`.) Want a whole folder? Ask and, with permission to act, it'll zip it
-first.
+The file it's after is found **deterministically** (it parses the path/filename
+and the folder you named — no guessing by the model), so it's reliable. This is
+read-only, so it works in any mode, even `lock`. The drop folder name is
+configurable via `ONEDRIVE_DROP` in `.env`.
 
 **Changing what it's allowed to do, remotely:** when you're away from the
 laptop, send `/auto` to let it act without asking, or `/lock` to stop it
