@@ -95,6 +95,16 @@ commit `.env`; if the token leaks, `/revoke` in @BotFather.
 
 `/help`, `/ping`, `/cwd`, `/new` (reset conversation).
 
+## Offline alert
+
+`install_shutdown_notifier()` (called once at startup) registers an `atexit`
+hook plus a Windows console control handler (`SetConsoleCtrlHandler` via ctypes)
+so `notify_offline()` sends a one-time "🔴 Bridge offline" Telegram message on
+Ctrl+C, terminal close, logoff, shutdown, or crash. It uses a 4 s timeout to
+beat the OS's ~5 s kill window on console close. A force-kill
+(`Stop-Process -Force`/TerminateProcess) can't be caught, so restarts done that
+way send no message.
+
 ## Common issues
 
 - **"Bad BOT_TOKEN"** → token wrong/revoked in `.env`.

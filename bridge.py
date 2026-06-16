@@ -14,6 +14,7 @@ that it just runs. Each person runs their own copy with their own bot + Claude
 account.
 """
 
+import atexit
 import json
 import os
 import re
@@ -721,6 +722,65 @@ def setup() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Offline notifier — tell the user when the bridge stops
+# --------------------------------------------------------------------------- #
+
+_offline_sent = False
+_offline_lock = threading.Lock()
+_console_handler_ref = None  # keep the ctypes callback alive
+
+
+def notify_offline(reason: str = "the bot was stopped") -> None:
+    """Send a one-time 'bridge offline' message (short timeout — we may be
+    racing the OS killing us when the terminal closes)."""
+    global _offline_sent
+    with _offline_lock:
+        if _offline_sent or not (BOT_TOKEN and ALLOWED_CHAT_ID):
+            return
+        _offline_sent = True
+    try:
+        requests.post(
+            f"{API}/sendMessage",
+            data={"chat_id": ALLOWED_CHAT_ID,
+                  "text": f"🔴 Bridge offline — {reason}. I won't reply until "
+                          "it's started again on the laptop."},
+            proxies=PROXIES, timeout=4,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def install_shutdown_notifier() -> None:
+    """Fire notify_offline on normal exit, Ctrl+C, and (Windows) on terminal
+    close / logoff / shutdown."""
+    atexit.register(notify_offline, "the bot was stopped")
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        reasons = {
+            0: "the bot was stopped",        # CTRL_C_EVENT
+            1: "the bot was stopped",        # CTRL_BREAK_EVENT
+            2: "the terminal was closed",    # CTRL_CLOSE_EVENT
+            5: "you logged off",             # CTRL_LOGOFF_EVENT
+            6: "the laptop is shutting down",  # CTRL_SHUTDOWN_EVENT
+        }
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+        def handler(ctrl_type):
+            notify_offline(reasons.get(ctrl_type, "the bot stopped"))
+            return False  # let default handling continue (terminate / Ctrl+C)
+
+        global _console_handler_ref
+        _console_handler_ref = handler
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[shutdown] console handler not installed: {exc}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
 
@@ -748,6 +808,7 @@ def main() -> None:
 
     send(ALLOWED_CHAT_ID,
          f"✅ Claude bridge online.\n{MODE_DESC[_mode]}\nSend /help.")
+    install_shutdown_notifier()
 
     while True:
         resp = tg("getUpdates", offset=offset, timeout=POLL_TIMEOUT)

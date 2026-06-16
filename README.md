@@ -80,7 +80,9 @@ To reconfigure later (new bot, new folder, etc.), run `py bridge.py --setup`.
 Double-click **`start.bat`** (or run `py bridge.py`). You'll see
 `✅ Connected as @yourbot` and get an "online" message in Telegram.
 
-Leave the window open while you want the bot live. Close it to stop.
+Leave the window open while you want the bot live. Close it to stop — when you
+close the terminal (or log off / shut down), the bot sends you a **"🔴 Bridge
+offline"** message on Telegram so you know it won't reply until it's restarted.
 
 ---
 
