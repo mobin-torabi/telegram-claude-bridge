@@ -17,6 +17,7 @@ account.
 import json
 import os
 import shutil
+import string
 import subprocess
 import sys
 import threading
@@ -113,6 +114,50 @@ _session_id = None
 _pending = False
 _claude_lock = threading.Lock()
 
+# --------------------------------------------------------------------------- #
+# Permission modes (controllable from the bot)
+# --------------------------------------------------------------------------- #
+#   lock  -> answers questions only; never changes anything, even on "yes".
+#   ask   -> proposes a plan and waits for "yes" before acting (default).
+#   auto  -> acts immediately with full permissions, no asking.
+VALID_MODES = ("lock", "ask", "auto")
+MODE_DESC = {
+    "lock": "🔒 lock — I only answer questions; I won't change anything.",
+    "ask":  "🟡 ask — I propose changes and wait for your 'yes' (default).",
+    "auto": "🟢 auto — I act immediately, no asking. Full access to the laptop.",
+}
+STATE_PATH = BASE_DIR / ".bridge_state.json"
+_mode = "ask"
+
+
+def load_state() -> None:
+    global _mode
+    try:
+        m = json.loads(STATE_PATH.read_text(encoding="utf-8")).get("mode")
+        if m in VALID_MODES:
+            _mode = m
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def save_state() -> None:
+    try:
+        STATE_PATH.write_text(json.dumps({"mode": _mode}), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def system_dirs() -> list:
+    """Top-level roots to grant read access to, so Q&A can reach anywhere."""
+    if os.name == "nt":
+        return [f"{d}:\\" for d in string.ascii_uppercase
+                if os.path.exists(f"{d}:\\")]
+    return ["/"]
+
+
+# Whole-machine read access for the (read-only) plan pass.
+EXTRA_DIRS = system_dirs()
+
 
 # --------------------------------------------------------------------------- #
 # Telegram helpers
@@ -163,6 +208,8 @@ def run_claude(prompt: str, mode: str) -> dict:
     cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json"]
     if mode == "plan":
         cmd += ["--permission-mode", "plan", "--append-system-prompt", PLAN_SYS]
+        for d in EXTRA_DIRS:  # let read-only Q&A reach any drive/folder
+            cmd += ["--add-dir", d]
     else:
         cmd += ["--dangerously-skip-permissions",
                 "--append-system-prompt", EXEC_SYS]
@@ -221,13 +268,21 @@ def run_claude(prompt: str, mode: str) -> dict:
 HELP = (
     "🤖 Claude bridge\n\n"
     "Ask me anything and I'll answer. If a request means changing something on "
-    "your laptop, I'll show a short plan and ask first — reply *yes* and I'll "
-    "do it.\n\n"
+    "your laptop, what happens depends on the permission mode:\n\n"
+    "🔒 /lock — answers only, never changes anything\n"
+    "🟡 /ask — propose a plan, wait for your *yes* (default)\n"
+    "🟢 /auto — act immediately, no asking (full access)\n"
+    "/mode — show the current mode\n\n"
     "/new — start a fresh conversation (clears memory)\n"
     "/cwd — show my working directory\n"
     "/ping — check I'm alive\n"
     "/help — this message"
 )
+
+
+def mode_status(changed: bool = False) -> str:
+    head = "Permission mode changed to:" if changed else "Permission mode:"
+    return (f"{head}\n{MODE_DESC[_mode]}\n\nSwitch anytime: /lock · /ask · /auto")
 
 # Words/phrases that count as approving a pending plan.
 _YES_WORDS = {
@@ -268,7 +323,7 @@ def ask_claude(chat_id, text: str, mode: str) -> dict:
 
 
 def handle(chat_id, text: str) -> None:
-    global _session_id, _pending
+    global _session_id, _pending, _mode
     cmd = text.strip().lower()
 
     if cmd in ("/start", "/help"):
@@ -280,6 +335,15 @@ def handle(chat_id, text: str) -> None:
     if cmd == "/cwd":
         send(chat_id, f"📂 {WORKING_DIR}")
         return
+    if cmd == "/mode":
+        send(chat_id, mode_status())
+        return
+    if cmd in ("/lock", "/ask", "/auto"):
+        _mode = cmd[1:]
+        _pending = False
+        save_state()
+        send(chat_id, mode_status(changed=True))
+        return
     if cmd == "/new":
         with _claude_lock:
             _session_id = None
@@ -287,24 +351,36 @@ def handle(chat_id, text: str) -> None:
         send(chat_id, "🧹 Fresh conversation started.")
         return
 
-    # A plan is awaiting approval and this reply is a clear yes -> execute it.
-    if _pending and is_affirmative(text):
+    # auto: full permissions, act immediately, no questions asked.
+    if _mode == "auto":
         _pending = False
         res = ask_claude(chat_id, text, mode="execute")
         send(chat_id, res["text"])
         return
 
-    # Otherwise treat it as a fresh request: read-only plan pass. Nothing on the
-    # laptop changes here — at most Claude proposes a plan and asks.
+    # ask: a plan is awaiting approval and this reply is a clear yes -> do it.
+    if _mode == "ask" and _pending and is_affirmative(text):
+        _pending = False
+        res = ask_claude(chat_id, text, mode="execute")
+        send(chat_id, res["text"])
+        return
+
+    # lock / ask: read-only plan pass. Nothing on the laptop changes here.
     _pending = False
     res = ask_claude(chat_id, text, mode="plan")
-    if res["plan"]:
-        _pending = True
-        msg = "📋 I'd like to do this:\n\n" + res["plan"]
-        msg += "\n\n— Reply *yes* to go ahead, or tell me what to change."
-        send(chat_id, msg)
-    else:
+    if not res["plan"]:
         send(chat_id, res["text"])
+        return
+
+    if _mode == "lock":
+        send(chat_id, "🔒 Actions are locked, so I won't change anything.\n"
+                      "Send /ask to approve per request, or /auto for full "
+                      "access.\n\nFor reference, here's what I'd do:\n\n"
+                      + res["plan"])
+    else:  # ask
+        _pending = True
+        send(chat_id, "📋 I'd like to do this:\n\n" + res["plan"]
+             + "\n\n— Reply *yes* to go ahead, or tell me what to change.")
 
 
 # --------------------------------------------------------------------------- #
@@ -460,8 +536,9 @@ def main() -> None:
         sys.exit("Bad BOT_TOKEN — Telegram rejected it. Run again with --setup "
                  "to reconfigure.")
     name = me["result"].get("username", "bot")
+    load_state()
     print(f"✅ Connected as @{name}. Working dir: {WORKING_DIR}")
-    print(f"   Authorized chat id: {ALLOWED_CHAT_ID}")
+    print(f"   Authorized chat id: {ALLOWED_CHAT_ID} | mode: {_mode}")
 
     # Drain any backlog so we don't replay old messages from while we were off.
     offset = None
@@ -469,7 +546,8 @@ def main() -> None:
     if drain.get("ok") and drain["result"]:
         offset = drain["result"][-1]["update_id"] + 1
 
-    send(ALLOWED_CHAT_ID, "✅ Claude bridge online. Send /help.")
+    send(ALLOWED_CHAT_ID,
+         f"✅ Claude bridge online.\n{MODE_DESC[_mode]}\nSend /help.")
 
     while True:
         resp = tg("getUpdates", offset=offset, timeout=POLL_TIMEOUT)

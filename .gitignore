@@ -1,8 +1,9 @@
 # Secrets — never commit
 .env
 
-# Runtime logs
+# Runtime logs / state
 *.log
+.bridge_state.json
 
 # Python
 __pycache__/

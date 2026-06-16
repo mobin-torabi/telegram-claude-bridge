@@ -8,21 +8,28 @@ It works by feeding each Telegram message to the local `claude` CLI in headless
 mode, then sending Claude's answer back to the chat. Conversation context is
 kept between messages, so you can have a back-and-forth.
 
-**Ask-before-acting:** every message first runs in read-only **plan mode** —
-Claude can answer questions and inspect things, but cannot change anything. If a
-request requires modifying the machine, Claude replies with a short plan and
-waits. Only when you reply **yes** does it re-run with full permissions and
-carry the plan out.
+**Permission modes** decide what it can do, and you switch them from the bot:
+
+| Mode | What it does |
+|------|--------------|
+| 🔒 `/lock` | Answers questions only — never changes anything, even if you say yes. |
+| 🟡 `/ask` | **Default.** Proposes a short plan and waits for your **yes** before acting. |
+| 🟢 `/auto` | Acts immediately with full permissions, no asking. |
+
+In every mode it can **read anywhere** on the machine to answer questions
+(all drives/subfolders). Changing things needs `ask`+yes or `auto`. The mode is
+remembered across restarts, so you can `/auto` while away and `/lock` when done.
 
 ---
 
 ## ⚠️ Read this first — security
 
-Two layers protect the machine:
+When acting (`ask`+yes, or `auto`) Claude runs with
+`--dangerously-skip-permissions` — it can touch **anything on the machine**, not
+just one folder. Two things protect you:
 
-1. **Approval gate.** By default Claude runs read-only (`--permission-mode
-   plan`) and can't modify anything. It only executes (with
-   `--dangerously-skip-permissions`) after you approve a proposed plan.
+1. **The mode gate you control.** `lock` allows nothing, `ask` requires your yes
+   per request, `auto` is hands-off. You change it any time from Telegram.
 2. **Chat-id allowlist.** The bot ignores every message that isn't from your
    `ALLOWED_CHAT_ID`.
 
@@ -97,14 +104,20 @@ Reply with anything other than a clear yes (or a tweak like "yes but zip it")
 and it re-plans instead of acting. Affirmatives are recognized in English and
 Persian.
 
+**Changing what it's allowed to do, remotely:** when you're away from the
+laptop, send `/auto` to let it act without asking, or `/lock` to stop it
+changing anything. `/mode` shows the current setting.
+
 Commands:
 
 | Command | What it does |
 |---------|--------------|
-| `/help` | Show help |
-| `/ping` | Check the bot is alive |
-| `/cwd`  | Show Claude's working directory |
+| `/lock` `/ask` `/auto` | Set permission mode (see table above) |
+| `/mode` | Show the current permission mode |
 | `/new`  | Start a fresh conversation (clears context) |
+| `/cwd`  | Show Claude's working directory |
+| `/ping` | Check the bot is alive |
+| `/help` | Show help |
 
 While Claude works you'll see the "typing…" indicator. Long tasks just take a
 bit; the reply arrives when it's done.

@@ -29,6 +29,21 @@ yes:
 
 `PLAN_SYS` / `EXEC_SYS` are the per-phase appended system prompts.
 
+## Permission modes (set from the bot)
+
+`_mode` ∈ {`lock`, `ask`, `auto`}, persisted in `.bridge_state.json`
+(gitignored), changed via `/lock` `/ask` `/auto`, shown via `/mode`:
+
+- **lock** — only the plan pass runs; any proposed action is refused (no
+  approval offered).
+- **ask** — default; plan → approval → execute (the flow above).
+- **auto** — every message goes straight to the execute pass (full
+  permissions, no asking).
+
+The plan pass is launched with `--add-dir` for every drive root
+(`EXTRA_DIRS` / `system_dirs()`), so read-only Q&A can reach anywhere on the
+machine. Execute pass uses `--dangerously-skip-permissions` (whole machine).
+
 Project root: `D:\Mobin\Automation Programs\Telegram Claude Bridge`
 
 ## Run / stop
