@@ -129,6 +129,16 @@ FILE_SYS = (
     "[[SENDFILE: C:\\Users\\You\\Desktop\\notes.txt]]"
 )
 
+# Prepended to the user's text for a clear "send me a file" request, to force
+# the actual file out as an attachment instead of a chatty summary.
+FILE_DIRECTIVE = (
+    "\n\n[INSTRUCTION: The user wants to RECEIVE the file(s) above as a Telegram "
+    "attachment. Find each file's absolute path and output exactly one line per "
+    "file: [[SENDFILE: <absolute path>]] — with nothing about the contents. Do "
+    "NOT paste, summarize, quote, or describe the file. If you genuinely cannot "
+    "find the file, say so in one short sentence.]"
+)
+
 CLAUDE_BIN = shutil.which("claude") or "claude"
 
 # Per-conversation Claude session id, so the bot keeps context between messages.
@@ -290,8 +300,8 @@ def run_claude(prompt: str, mode: str) -> dict:
     global _session_id
 
     # NOTE: pass ONE --append-system-prompt only. This CLI keeps just the last
-    # occurrence, so combine the mode prompt and the file-delivery prompt.
-    sys_prompt = (PLAN_SYS if mode == "plan" else EXEC_SYS) + "\n\n" + FILE_SYS
+    # occurrence, so combine the prompts. Lead with the file rule for emphasis.
+    sys_prompt = FILE_SYS + "\n\n" + (PLAN_SYS if mode == "plan" else EXEC_SYS)
     cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json",
            "--append-system-prompt", sys_prompt]
     if mode == "plan":
@@ -348,6 +358,40 @@ def run_claude(prompt: str, mode: str) -> dict:
     return {"text": result or "(no text result)", "plan": None}
 
 
+def request_file_reply(text: str) -> str:
+    """One-off, read-only pass that returns Claude's reply for a file request.
+
+    Isolated (no session persistence) so the chatty main conversation can't talk
+    it out of just emitting the [[SENDFILE]] marker. Read-only, so it's safe and
+    works regardless of permission mode. deliver() then sends any flagged files.
+    """
+    cmd = [CLAUDE_BIN, "-p", text + FILE_DIRECTIVE, "--output-format", "json",
+           "--permission-mode", "plan", "--no-session-persistence",
+           "--append-system-prompt", FILE_SYS]
+    for d in EXTRA_DIRS:
+        cmd += ["--add-dir", d]
+    if CLAUDE_MODEL:
+        cmd += ["--model", CLAUDE_MODEL]
+    try:
+        proc = subprocess.run(cmd, cwd=WORKING_DIR, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=CLAUDE_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[filereq] {exc}", file=sys.stderr)
+        return "⚠️ Couldn't look up that file."
+    out = (proc.stdout or "").strip()
+    if not out:
+        return "🔍 I couldn't find that file."
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        # Not JSON — e.g. a rate-limit notice. Surface it rather than hide it.
+        return out[:TG_LIMIT]
+    if data.get("is_error"):
+        return f"⚠️ {data.get('result') or 'Couldn’t look up that file.'}"
+    return data.get("result", "") or "🔍 I couldn't find that file."
+
+
 # --------------------------------------------------------------------------- #
 # Message handling
 # --------------------------------------------------------------------------- #
@@ -399,6 +443,41 @@ def is_affirmative(text: str) -> bool:
     return any(p in t for p in _YES_PHRASES)
 
 
+# A "deliver me a file" request (vs. "show me what's in it").
+_SEND_VERBS = ("send", "get me", "download", "share", "fetch", "grab", "upload",
+               "give me", "deliver", "بفرست", "بده", "برام بفرست", "دانلود")
+_FILE_HINTS = ("file", "pdf", "zip", "doc", "xls", "ppt", "image", "photo",
+               "picture", "screenshot", "html", "csv", "txt", "png", "jpg",
+               "jpeg", "mp3", "mp4", "attachment", "فایل", "عکس", "فیلم")
+_VIEW_WORDS = ("what's in", "whats in", "what is in", "contents", "content of",
+               "read ", "open ", "show ", "inside", "summary", "summarize",
+               "what does", "tell me what", "محتوا", "بازکن", "نشون")
+_PATHISH = re.compile(r"[a-zA-Z]:[\\/]|[\\/][\w.\- ]+[\\/]|\.\w{2,5}\b")
+
+
+def wants_file(text: str) -> bool:
+    """High-confidence request to be sent a file (not shown its contents)."""
+    t = text.lower()
+    if any(v in t for v in _VIEW_WORDS):
+        return False
+    has_verb = any(v in t for v in _SEND_VERBS)
+    has_hint = any(h in t for h in _FILE_HINTS) or bool(_PATHISH.search(text))
+    return has_verb and has_hint
+
+
+def deliver_requested_files(chat_id, text: str) -> None:
+    """Find the file(s) the user wants and upload them (via deliver's markers)."""
+    stop = threading.Event()
+    th = threading.Thread(target=typing_loop, args=(chat_id, stop), daemon=True)
+    th.start()
+    try:
+        with _claude_lock:
+            reply = request_file_reply(text)
+    finally:
+        stop.set()
+    deliver(chat_id, reply)
+
+
 def ask_claude(chat_id, text: str, mode: str) -> dict:
     """Run Claude with a live 'typing…' indicator and return its result dict."""
     stop = threading.Event()
@@ -438,6 +517,12 @@ def handle(chat_id, text: str) -> None:
             _session_id = None
             _pending = False
         send(chat_id, "🧹 Fresh conversation started.")
+        return
+
+    # "Send me <file>" is read-only, so handle it the reliable way in any mode:
+    # resolve the path with a dedicated pass and upload the actual file.
+    if wants_file(text):
+        deliver_requested_files(chat_id, text)
         return
 
     # auto: full permissions, act immediately, no questions asked.

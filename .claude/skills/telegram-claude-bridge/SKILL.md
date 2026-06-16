@@ -46,12 +46,20 @@ machine. Execute pass uses `--dangerously-skip-permissions` (whole machine).
 
 ## Sending files to the user
 
-`FILE_SYS` (appended to the prompt in every mode) tells Claude to deliver a file
-by printing `[[SENDFILE: <absolute path>]]`. `deliver()` strips those markers
-from the reply and calls `send_file()`, which uploads via Telegram
-`sendDocument` (≤ ~50 MB) or, for bigger files, `upload_large()` → 0x0.st and
-sends the link. Fetching an existing file is read-only, so it works in `lock`
-mode too (no approval). Uploads go through `PROXIES` like everything else.
+Claude flags a file for delivery by printing `[[SENDFILE: <absolute path>]]`.
+`deliver()` strips those markers from the reply and calls `send_file()`, which
+uploads via Telegram `sendDocument` (≤ ~50 MB) or, for bigger files,
+`upload_large()` → 0x0.st and sends the link. Fetching a file is read-only, so
+it works in `lock` mode too. Uploads go through `PROXIES`.
+
+Because the chatty main model often *summarizes* a file instead of sending it,
+clear "send me a file" asks are detected by `wants_file()` (send-verb + file
+hint, excluding "show/read/what's in") and routed to `deliver_requested_files()`
+→ `request_file_reply()`: a one-off, read-only, no-session-persistence pass with
+`FILE_DIRECTIVE` prepended to force the `[[SENDFILE]]` marker (no summary). This
+runs in every mode and bypasses the possibly-contaminated main session.
+`FILE_SYS` still rides along in the normal flow for files Claude volunteers
+mid-conversation.
 
 Project root: `D:\Mobin\Automation Programs\Telegram Claude Bridge`
 
