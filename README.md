@@ -35,27 +35,36 @@ Two layers protect the machine:
 
 ---
 
-## One-time setup
+## Setup — just run it
 
-1. **Create the bot**
-   - In Telegram, open **@BotFather** → `/newbot` → pick a name and username.
-   - Copy the **token** it gives you.
+There's no config file to hand-edit. The **first time** you start it, a setup
+wizard walks you through everything:
 
-2. **Get your chat id**
-   - Open **@userinfobot** in Telegram and press start. It shows your numeric
-     **Id** — that's your `ALLOWED_CHAT_ID`.
+1. **Get the code & start it**
+   ```
+   git clone https://github.com/mobin-torabi/telegram-claude-bridge
+   cd telegram-claude-bridge
+   ```
+   Then double-click **`start.bat`** (it installs dependencies on first run).
 
-3. **Configure**
-   ```
-   copy .env.example .env
-   ```
-   Open `.env` and fill in `BOT_TOKEN` and `ALLOWED_CHAT_ID`. Optionally set
-   `WORKING_DIR` to the folder Claude should work in by default.
+2. **Create your own bot** (the wizard reminds you how)
+   - In Telegram, open **@BotFather** → `/newbot` → pick a name + username.
+   - Copy the **token** it gives you and paste it into the wizard.
 
-4. **Dependencies** are installed automatically by `start.bat`, or manually:
-   ```
-   py -m pip install -r requirements.txt
-   ```
+3. **It auto-detects the rest**
+   - **Connection:** tries Telegram directly; if blocked, finds your VPN/proxy
+     automatically (or asks for a proxy URL).
+   - **Your Telegram id:** press Enter, then send your bot any message — it
+     captures your id for you. (Or paste the id if you already know it.)
+   - **Working folder:** press Enter for your home folder, or type another.
+
+That writes a local `.env` and starts the bot. You won't be asked again.
+
+> Every user runs their **own** copy: their own bot token, their own laptop,
+> their own Claude account. A bot can't be shared — one bot controls one
+> machine.
+
+To reconfigure later (new bot, new folder, etc.), run `py bridge.py --setup`.
 
 ---
 

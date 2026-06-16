@@ -37,6 +37,16 @@ Project root: `D:\Mobin\Automation Programs\Telegram Claude Bridge`
 - Stop: close the window / Ctrl-C.
 - It's **manual start** by design — not registered to auto-run on boot.
 
+## First-run setup (portable)
+
+If `.env` is missing (or `py bridge.py --setup`), `setup()` runs an interactive
+wizard: asks for the user's own BotFather token, calls `find_connection()` to
+pick a direct route or auto-detect a local VPN/proxy port (falling back to
+asking), uses `detect_chat_id()` to capture the chat id from the first message
+the user sends the bot, then `write_env()` saves `.env` and `apply_env()` loads
+it. Each user runs their own copy (own bot + own Claude account) — bots can't be
+shared (one bot = one polling machine).
+
 ## Config
 
 All config is in `.env` (gitignored; copy from `.env.example`):

@@ -8,7 +8,10 @@ laptop. Claude's reply is sent back to Telegram. Because it runs with
 (run commands, edit files, etc.) -- so the ONLY thing standing between a
 stranger and your laptop is the chat-id allowlist. Keep your bot token secret.
 
-Config comes from a .env file next to this script (see .env.example).
+On first run (or with --setup) it walks you through creating your own Telegram
+bot, auto-detects your chat id and any needed proxy, and writes a .env. After
+that it just runs. Each person runs their own copy with their own bot + Claude
+account.
 """
 
 import json
@@ -50,23 +53,37 @@ def load_env(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-load_env(BASE_DIR / ".env")
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
-WORKING_DIR = os.environ.get("WORKING_DIR", str(Path.home())).strip()
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()  # optional, e.g. claude-opus-4-8
-# Hard ceiling so a runaway task can't block the bot forever (seconds).
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
-# Optional proxy for reaching api.telegram.org (e.g. where Telegram is blocked).
-# Example: http://127.0.0.1:10808  (v2rayN's default local proxy)
-PROXY = os.environ.get("PROXY", "").strip()
-PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
-# Long-poll seconds. Keep short when behind a proxy that drops idle tunnels.
-POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "20" if not PROXY else "10"))
-
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+ENV_PATH = BASE_DIR / ".env"
 TG_LIMIT = 4000  # Telegram hard limit is 4096; leave headroom.
+
+# Config globals — populated by apply_env() from os.environ / .env.
+BOT_TOKEN = ALLOWED_CHAT_ID = WORKING_DIR = CLAUDE_MODEL = PROXY = ""
+CLAUDE_TIMEOUT = POLL_TIMEOUT = 0
+PROXIES = None
+API = ""
+
+
+def apply_env() -> None:
+    """(Re)load config globals from os.environ. Safe to call after setup."""
+    global BOT_TOKEN, ALLOWED_CHAT_ID, WORKING_DIR, CLAUDE_MODEL
+    global CLAUDE_TIMEOUT, PROXY, PROXIES, POLL_TIMEOUT, API
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+    ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
+    WORKING_DIR = os.environ.get("WORKING_DIR", str(Path.home())).strip()
+    CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()  # e.g. claude-opus-4-8
+    # Hard ceiling so a runaway task can't block the bot forever (seconds).
+    CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800") or "1800")
+    # Optional proxy for api.telegram.org (e.g. where Telegram is blocked).
+    PROXY = os.environ.get("PROXY", "").strip()
+    PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
+    # Long-poll seconds. Keep short behind a proxy that drops idle tunnels.
+    POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "20" if not PROXY else "10")
+                       or "10")
+    API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+
+load_env(ENV_PATH)
+apply_env()
 
 # Sent on the read-only (plan) pass: answer questions, but only *propose* actions.
 PLAN_SYS = (
@@ -291,17 +308,157 @@ def handle(chat_id, text: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# First-run setup wizard
+# --------------------------------------------------------------------------- #
+
+# Local proxy ports commonly exposed by VPN clients (v2rayN, Clash, Tor, etc.).
+PROXY_PORTS = [10808, 10809, 2080, 1080, 7890, 7891, 8889, 8080, 10800, 9150]
+
+
+def _check_token(token: str, proxy: str, timeout: int = 8):
+    """Return the bot info dict if getMe succeeds via this proxy, else None."""
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getMe",
+                         timeout=timeout, proxies=proxies)
+        data = r.json()
+        return data["result"] if data.get("ok") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def find_connection(token: str):
+    """Find a way to reach Telegram. Returns (proxy_url, bot_info) or (None, None)."""
+    print("→ Testing a direct connection to Telegram ...")
+    info = _check_token(token, "", timeout=10)
+    if info:
+        print("  ✓ Reachable directly — no proxy needed.")
+        return "", info
+
+    print("  ✗ Can't reach Telegram directly (it may be blocked on this network).")
+    print("→ Scanning for a local proxy from your VPN client ...")
+    for port in PROXY_PORTS:
+        for scheme in ("socks5h", "http"):
+            url = f"{scheme}://127.0.0.1:{port}"
+            info = _check_token(token, url, timeout=6)
+            if info:
+                print(f"  ✓ Found a working proxy: {url}")
+                return url, info
+    print("  ✗ No working local proxy found.")
+
+    while True:
+        url = input("  Enter a proxy URL (e.g. socks5h://127.0.0.1:10808), "
+                    "or blank to retry direct: ").strip()
+        info = _check_token(token, url, timeout=10)
+        if info:
+            return url, info
+        print("  ✗ Still can't reach Telegram. Make sure your VPN/proxy is "
+              "running, then try again. (Ctrl+C to abort.)")
+
+
+def detect_chat_id(token: str, proxy: str) -> str:
+    """Wait for the user to message the bot and capture their chat id."""
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    base = f"https://api.telegram.org/bot{token}"
+    # Drain backlog so we only react to a brand-new message.
+    offset = None
+    try:
+        r = requests.get(f"{base}/getUpdates", params={"timeout": 0},
+                         timeout=15, proxies=proxies).json()
+        if r.get("ok") and r["result"]:
+            offset = r["result"][-1]["update_id"] + 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    print("\n→ Open Telegram, find your bot, and send it any message (e.g. 'hi').")
+    print("  Waiting for your message ...")
+    while True:
+        try:
+            r = requests.get(f"{base}/getUpdates",
+                             params={"timeout": 25, "offset": offset},
+                             timeout=40, proxies=proxies).json()
+        except Exception:  # noqa: BLE001
+            continue
+        if not r.get("ok"):
+            time.sleep(2)
+            continue
+        for upd in r["result"]:
+            offset = upd["update_id"] + 1
+            msg = upd.get("message") or upd.get("edited_message")
+            if msg and msg.get("chat"):
+                cid = msg["chat"]["id"]
+                who = msg.get("from", {}).get("first_name", "you")
+                print(f"  ✓ Got it — message from {who} (id {cid}).")
+                return str(cid)
+
+
+def write_env(token: str, chat_id: str, working_dir: str, proxy: str) -> None:
+    lines = [
+        "# Written by first-run setup. Safe to edit by hand.",
+        f"BOT_TOKEN={token}",
+        f"ALLOWED_CHAT_ID={chat_id}",
+        f"WORKING_DIR={working_dir}",
+        f"PROXY={proxy}",
+        "CLAUDE_MODEL=",
+        "CLAUDE_TIMEOUT=1800",
+    ]
+    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def setup() -> None:
+    """Interactive first-run setup; writes .env and loads it."""
+    print("=" * 64)
+    print(" Telegram ↔ Claude bridge — first-run setup")
+    print("=" * 64)
+    print(
+        "\nThis bot runs on THIS computer with YOUR Claude account, and you\n"
+        "control it from your own Telegram bot. You need your own bot (free):\n"
+        "  1. In Telegram, open @BotFather\n"
+        "  2. Send /newbot and pick a name + username\n"
+        "  3. Copy the token it gives you (looks like 123456:ABC-def...)\n"
+    )
+
+    info = None
+    proxy = token = ""
+    while not info:
+        token = input("Paste your bot token: ").strip()
+        if not token:
+            continue
+        proxy, info = find_connection(token)
+        if not info:
+            print("  ✗ That token was rejected by Telegram. Try again.\n")
+    print(f"\n✓ Connected to @{info.get('username', 'your bot')}.")
+
+    raw = input("\nPress Enter to auto-detect your Telegram ID by messaging the "
+                "bot,\nor paste your numeric ID if you know it: ").strip()
+    chat_id = raw if raw.isdigit() else detect_chat_id(token, proxy)
+
+    home = str(Path.home())
+    wd = input(f"\nFolder Claude should work in [{home}]: ").strip() or home
+
+    write_env(token, chat_id, wd, proxy)
+    for k, v in {"BOT_TOKEN": token, "ALLOWED_CHAT_ID": chat_id,
+                 "WORKING_DIR": wd, "PROXY": proxy}.items():
+        os.environ[k] = v
+    apply_env()
+    print("\n✓ Setup complete — saved to .env. Starting the bot ...\n")
+
+
+# --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    if not BOT_TOKEN or not ALLOWED_CHAT_ID:
-        sys.exit("Missing BOT_TOKEN or ALLOWED_CHAT_ID. Copy .env.example to "
-                 ".env and fill them in.")
+    if "--setup" in sys.argv or not (BOT_TOKEN and ALLOWED_CHAT_ID):
+        try:
+            setup()
+        except (KeyboardInterrupt, EOFError):
+            sys.exit("\nSetup cancelled.")
 
     me = tg("getMe")
     if not me.get("ok"):
-        sys.exit("Bad BOT_TOKEN — Telegram rejected it.")
+        sys.exit("Bad BOT_TOKEN — Telegram rejected it. Run again with --setup "
+                 "to reconfigure.")
     name = me["result"].get("username", "bot")
     print(f"✅ Connected as @{name}. Working dir: {WORKING_DIR}")
     print(f"   Authorized chat id: {ALLOWED_CHAT_ID}")
