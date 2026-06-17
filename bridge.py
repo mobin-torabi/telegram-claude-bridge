@@ -24,7 +24,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from pathlib import Path
 
 import requests
@@ -133,11 +132,31 @@ FILE_SYS = (
 
 CLAUDE_BIN = shutil.which("claude") or "claude"
 
-# Per-conversation Claude session id, so the bot keeps context between messages.
-_session_id = None
+# Rolling transcript so the bot remembers the conversation (the CLI's own
+# session resume proved unreliable here, so we carry context ourselves).
+_history = []            # list of (user_text, assistant_text)
+_HISTORY_TURNS = 12      # how many recent turns to feed back in
 # True while a proposed plan is waiting for the owner's yes/no.
 _pending = False
 _claude_lock = threading.Lock()
+
+
+def history_preamble() -> str:
+    """Recent conversation, prepended to each prompt so the model has context."""
+    if not _history:
+        return ""
+    lines = []
+    for user_text, assistant_text in _history[-_HISTORY_TURNS:]:
+        lines.append(f"User: {user_text}")
+        lines.append(f"You: {assistant_text}")
+    return ("[Conversation so far, for your context — don't repeat it back:\n"
+            + "\n".join(lines) + "\n]\n\n")
+
+
+def record_turn(user_text: str, assistant_text: str) -> None:
+    """Append a turn to the rolling transcript (trimmed to a sane size)."""
+    _history.append((user_text[:2000], (assistant_text or "")[:1500]))
+    del _history[:-_HISTORY_TURNS]
 
 # --------------------------------------------------------------------------- #
 # Permission modes (controllable from the bot)
@@ -269,25 +288,20 @@ def run_claude(prompt: str, mode: str) -> dict:
     approval before acting (it tried to leave plan mode) and "plan" holds the
     proposed steps.
     """
-    global _session_id
-
     # NOTE: pass ONE --append-system-prompt only. This CLI keeps just the last
     # occurrence, so combine the prompts. Lead with the file rule for emphasis.
     sys_prompt = FILE_SYS + "\n\n" + (PLAN_SYS if mode == "plan" else EXEC_SYS)
-    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json",
-           "--append-system-prompt", sys_prompt]
+    # Memory is handled by us: the CLI's --resume didn't reliably restore history
+    # here, so each call is stateless and we prepend the recent transcript.
+    full_prompt = history_preamble() + prompt
+    cmd = [CLAUDE_BIN, "-p", full_prompt, "--output-format", "json",
+           "--no-session-persistence", "--append-system-prompt", sys_prompt]
     if mode == "plan":
         cmd += ["--permission-mode", "plan"]
         for d in EXTRA_DIRS:  # let read-only Q&A reach any drive/folder
             cmd += ["--add-dir", d]
     else:
         cmd += ["--dangerously-skip-permissions"]
-
-    if _session_id:
-        cmd += ["--resume", _session_id]
-    else:
-        _session_id = str(uuid.uuid4())
-        cmd += ["--session-id", _session_id]
     if CLAUDE_MODEL:
         cmd += ["--model", CLAUDE_MODEL]
 
@@ -313,8 +327,6 @@ def run_claude(prompt: str, mode: str) -> dict:
     except json.JSONDecodeError:
         return {"text": out[:TG_LIMIT], "plan": None}
 
-    # Keep session continuity in sync with what the CLI actually used.
-    _session_id = data.get("session_id", _session_id)
     result = data.get("result", "")
     if data.get("is_error"):
         return {"text": f"⚠️ {result or 'Claude reported an error.'}", "plan": None}
@@ -517,7 +529,7 @@ def ask_claude(chat_id, text: str, mode: str) -> dict:
 
 
 def handle(chat_id, text: str) -> None:
-    global _session_id, _pending, _mode
+    global _pending, _mode
     cmd = text.strip().lower()
 
     if cmd in ("/start", "/help"):
@@ -540,7 +552,7 @@ def handle(chat_id, text: str) -> None:
         return
     if cmd == "/new":
         with _claude_lock:
-            _session_id = None
+            _history.clear()
             _pending = False
         send(chat_id, "🧹 Fresh conversation started.")
         return
@@ -556,6 +568,7 @@ def handle(chat_id, text: str) -> None:
         _pending = False
         res = ask_claude(chat_id, text, mode="execute")
         deliver(chat_id, res["text"])
+        record_turn(text, res["text"])
         return
 
     # ask: a plan is awaiting approval and this reply is a clear yes -> do it.
@@ -563,6 +576,7 @@ def handle(chat_id, text: str) -> None:
         _pending = False
         res = ask_claude(chat_id, text, mode="execute")
         deliver(chat_id, res["text"])
+        record_turn(text, res["text"])
         return
 
     # lock / ask: read-only plan pass. Nothing on the laptop changes here
@@ -571,6 +585,7 @@ def handle(chat_id, text: str) -> None:
     res = ask_claude(chat_id, text, mode="plan")
     if not res["plan"]:
         deliver(chat_id, res["text"])
+        record_turn(text, res["text"])
         return
 
     if _mode == "lock":
@@ -582,6 +597,7 @@ def handle(chat_id, text: str) -> None:
         _pending = True
         send(chat_id, "📋 I'd like to do this:\n\n" + res["plan"]
              + "\n\n— Reply *yes* to go ahead, or tell me what to change.")
+    record_turn(text, res["plan"])
 
 
 # --------------------------------------------------------------------------- #

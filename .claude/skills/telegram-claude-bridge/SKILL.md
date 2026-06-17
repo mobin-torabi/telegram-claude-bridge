@@ -7,8 +7,14 @@ description: Start, stop, or troubleshoot the Telegram↔Claude bridge that lets
 
 A Python bot (`bridge.py`) that long-polls Telegram and, for each message from
 the authorized user, runs it through the local `claude` CLI in headless mode,
-then sends the result back. Conversation context is kept via
-`--session-id`/`--resume`.
+then sends the result back.
+
+Conversation memory is **bridge-controlled**: the CLI's `--session-id`/`--resume`
+did not reliably restore history in this environment (the returned session id
+didn't match what was passed, and resuming gave fresh memoryless sessions). So
+calls are stateless (`--no-session-persistence`) and `history_preamble()`
+prepends the last `_HISTORY_TURNS` turns of `_history` to each prompt;
+`record_turn()` appends after each reply; `/new` clears it.
 
 ## Ask-before-acting flow (important)
 
